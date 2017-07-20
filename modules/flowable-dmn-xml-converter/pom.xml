@@ -17,6 +17,9 @@
 		<flowable.artifact>
 			org.flowable.dmn.converter
 		</flowable.artifact>
+		<flowable.osgi.export.additional>
+			org.flowable.dmn.xml.constants,org.flowable.dmn.xml.converter,org.flowable.dmn.xml.exception
+		</flowable.osgi.export.additional>
 	</properties>
 
 	<dependencies>
