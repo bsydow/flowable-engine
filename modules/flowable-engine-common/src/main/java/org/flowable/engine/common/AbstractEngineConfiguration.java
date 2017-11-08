@@ -18,6 +18,7 @@ import java.io.Reader;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
@@ -44,6 +45,8 @@ import org.flowable.engine.common.api.delegate.event.FlowableEventListener;
 import org.flowable.engine.common.impl.cfg.CommandExecutorImpl;
 import org.flowable.engine.common.impl.cfg.IdGenerator;
 import org.flowable.engine.common.impl.cfg.TransactionContextFactory;
+import org.flowable.engine.common.impl.cfg.standalone.StandaloneMybatisTransactionContextFactory;
+import org.flowable.engine.common.impl.db.CommonDbSchemaManager;
 import org.flowable.engine.common.impl.db.CustomMyBatisTypeHandlerConfig;
 import org.flowable.engine.common.impl.db.CustomMybatisTypeAliasConfig;
 import org.flowable.engine.common.impl.db.DbSchemaManager;
@@ -51,10 +54,15 @@ import org.flowable.engine.common.impl.db.DbSqlSessionFactory;
 import org.flowable.engine.common.impl.event.EventDispatchAction;
 import org.flowable.engine.common.impl.interceptor.CommandConfig;
 import org.flowable.engine.common.impl.interceptor.CommandContextFactory;
+import org.flowable.engine.common.impl.interceptor.CommandContextInterceptor;
 import org.flowable.engine.common.impl.interceptor.CommandExecutor;
 import org.flowable.engine.common.impl.interceptor.CommandInterceptor;
+import org.flowable.engine.common.impl.interceptor.DefaultCommandInvoker;
+import org.flowable.engine.common.impl.interceptor.LogInterceptor;
 import org.flowable.engine.common.impl.interceptor.SessionFactory;
+import org.flowable.engine.common.impl.interceptor.TransactionContextInterceptor;
 import org.flowable.engine.common.impl.persistence.StrongUuidGenerator;
+import org.flowable.engine.common.impl.persistence.entity.Entity;
 import org.flowable.engine.common.impl.util.DefaultClockImpl;
 import org.flowable.engine.common.impl.util.IoUtil;
 import org.flowable.engine.common.runtime.Clock;
@@ -72,9 +80,7 @@ public abstract class AbstractEngineConfiguration {
      * Checks the version of the DB schema against the library when the form engine is being created and throws an exception if the versions don't match.
      */
     public static final String DB_SCHEMA_UPDATE_FALSE = "false";
-
     public static final String DB_SCHEMA_UPDATE_CREATE = "create";
-
     public static final String DB_SCHEMA_UPDATE_CREATE_DROP = "create-drop";
 
     /**
@@ -102,6 +108,7 @@ public abstract class AbstractEngineConfiguration {
     protected int jdbcPingConnectionNotUsedFor;
     protected int jdbcDefaultTransactionIsolationLevel;
     protected DataSource dataSource;
+    protected DbSchemaManager commonDbSchemaManager;
     protected DbSchemaManager dbSchemaManager;
 
     protected String databaseSchemaUpdate = DB_SCHEMA_UPDATE_FALSE;
@@ -122,6 +129,7 @@ public abstract class AbstractEngineConfiguration {
     protected List<CommandInterceptor> commandInterceptors;
     
     protected Map<String, AbstractEngineConfiguration> engineConfigurations = new HashMap<>();
+    protected Map<String, AbstractServiceConfiguration> serviceConfigurations = new HashMap<>();
 
     protected ClassLoader classLoader;
     /**
@@ -131,10 +139,27 @@ public abstract class AbstractEngineConfiguration {
 
     // MYBATIS SQL SESSION FACTORY /////////////////////////////////////
 
+    protected boolean isDbHistoryUsed = true;
     protected DbSqlSessionFactory dbSqlSessionFactory;
     protected SqlSessionFactory sqlSessionFactory;
     protected TransactionFactory transactionFactory;
     protected TransactionContextFactory transactionContextFactory;
+    
+    /**
+     * If set to true, enables bulk insert (grouping sql inserts together). Default true. 
+     * For some databases (eg DB2+z/OS) needs to be set to false.
+     */
+    protected boolean isBulkInsertEnabled = true;
+    
+    /**
+     * Some databases have a limit of how many parameters one sql insert can have (eg SQL Server, 2000 params (!= insert statements) ). Tweak this parameter in case of exceptions indicating too much
+     * is being put into one bulk insert, or make it higher if your database can cope with it and there are inserts with a huge amount of data.
+     * <p>
+     * By default: 100 (75 for mssql server as it has a hard limit of 2000 parameters in a statement)
+     */
+    protected int maxNrOfStatementsInBulkInsert = 100;
+
+    public int DEFAULT_MAX_NR_OF_STATEMENTS_BULK_INSERT_SQL_SERVER = 60; // currently Execution has most params (31). 2000 / 31 = 64.
 
     protected Set<Class<?>> customMybatisMappers;
     protected Set<String> customMybatisXMLMappers;
@@ -248,6 +273,16 @@ public abstract class AbstractEngineConfiguration {
 
     protected Clock clock;
     
+    // Variables
+    
+    public static final int DEFAULT_GENERIC_MAX_LENGTH_STRING = 4000;
+    public static final int DEFAULT_ORACLE_MAX_LENGTH_STRING = 2000;
+    
+    /**
+     * Define a max length for storing String variable types in the database. Mainly used for the Oracle NVARCHAR2 limit of 2000 characters
+     */
+    protected int maxLengthStringVariableType = -1;
+    
     // DataSource
     // ///////////////////////////////////////////////////////////////
 
@@ -337,6 +372,18 @@ public abstract class AbstractEngineConfiguration {
                 LOGGER.error("Exception while closing the Database connection", e);
             }
         }
+        
+        // Special care for MSSQL, as it has a hard limit of 2000 params per statement (incl bulk statement).
+        // Especially with executions, with 100 as default, this limit is passed.
+        if (DATABASE_TYPE_MSSQL.equals(databaseType)) {
+            maxNrOfStatementsInBulkInsert = DEFAULT_MAX_NR_OF_STATEMENTS_BULK_INSERT_SQL_SERVER;
+        }
+    }
+    
+    public void initDbSchemaManager() { 
+        if (this.commonDbSchemaManager == null) {
+            this.commonDbSchemaManager = new CommonDbSchemaManager();
+        }
     }
 
     // session factories ////////////////////////////////////////////////////////
@@ -344,6 +391,27 @@ public abstract class AbstractEngineConfiguration {
     public void addSessionFactory(SessionFactory sessionFactory) {
         sessionFactories.put(sessionFactory.getSessionType(), sessionFactory);
     }
+    
+    public void initCommandContextFactory() {
+        if (commandContextFactory == null) {
+            commandContextFactory = new CommandContextFactory();
+        }
+    }
+
+    public void initTransactionContextFactory() {
+        if (transactionContextFactory == null) {
+            transactionContextFactory = new StandaloneMybatisTransactionContextFactory();
+        }
+    }
+    
+    public void initCommandExecutors() {
+        initDefaultCommandConfig();
+        initSchemaCommandConfig();
+        initCommandInvoker();
+        initCommandInterceptors();
+        initCommandExecutor();
+    }
+    
 
     public void initDefaultCommandConfig() {
         if (defaultCommandConfig == null) {
@@ -353,8 +421,68 @@ public abstract class AbstractEngineConfiguration {
 
     public void initSchemaCommandConfig() {
         if (schemaCommandConfig == null) {
-            schemaCommandConfig = new CommandConfig().transactionNotSupported();
+            schemaCommandConfig = new CommandConfig();
         }
+    }
+    
+    public void initCommandInvoker() {
+        if (commandInvoker == null) {
+            commandInvoker = new DefaultCommandInvoker();
+        }
+    }
+    
+    public void initCommandInterceptors() {
+        if (commandInterceptors == null) {
+            commandInterceptors = new ArrayList<>();
+            if (customPreCommandInterceptors != null) {
+                commandInterceptors.addAll(customPreCommandInterceptors);
+            }
+            commandInterceptors.addAll(getDefaultCommandInterceptors());
+            if (customPostCommandInterceptors != null) {
+                commandInterceptors.addAll(customPostCommandInterceptors);
+            }
+            commandInterceptors.add(commandInvoker);
+        }
+    }
+    
+    public Collection<? extends CommandInterceptor> getDefaultCommandInterceptors() {
+        if (defaultCommandInterceptors == null) {
+            List<CommandInterceptor> interceptors = new ArrayList<>();
+            interceptors.add(new LogInterceptor());
+            
+            CommandInterceptor transactionInterceptor = createTransactionInterceptor();
+            if (transactionInterceptor != null) {
+                interceptors.add(transactionInterceptor);
+            }
+            
+            if (commandContextFactory != null) {
+                String engineCfgKey = getEngineCfgKey();
+                CommandContextInterceptor commandContextInterceptor = new CommandContextInterceptor(commandContextFactory);
+                engineConfigurations.put(engineCfgKey, this);
+                commandContextInterceptor.setEngineConfigurations(engineConfigurations);
+                commandContextInterceptor.setServiceConfigurations(serviceConfigurations);
+                commandContextInterceptor.setCurrentEngineConfigurationKey(engineCfgKey);
+                interceptors.add(commandContextInterceptor);
+            }
+            
+            if (transactionContextFactory != null) {
+                interceptors.add(new TransactionContextInterceptor(transactionContextFactory));
+            } 
+            
+            List<CommandInterceptor> additionalCommandInterceptors = getAdditionalDefaultCommandInterceptors();
+            if (additionalCommandInterceptors != null) {
+                interceptors.addAll(additionalCommandInterceptors);
+            }
+            
+            defaultCommandInterceptors = interceptors;
+        }
+        return defaultCommandInterceptors;
+    }
+    
+    public abstract String getEngineCfgKey();
+    
+    public List<CommandInterceptor> getAdditionalDefaultCommandInterceptors() {
+        return null;
     }
     
     public void initCommandExecutor() {
@@ -400,6 +528,45 @@ public abstract class AbstractEngineConfiguration {
 
     // myBatis SqlSessionFactory
     // ////////////////////////////////////////////////
+    
+    public void initDbSqlSessionFactory() {
+        if (dbSqlSessionFactory == null) {
+            dbSqlSessionFactory = createDbSqlSessionFactory();
+        }
+        dbSqlSessionFactory.setDatabaseType(databaseType);
+        dbSqlSessionFactory.setIdGenerator(idGenerator);
+        dbSqlSessionFactory.setSqlSessionFactory(sqlSessionFactory);
+        dbSqlSessionFactory.setDbHistoryUsed(isDbHistoryUsed);
+        dbSqlSessionFactory.setDatabaseTablePrefix(databaseTablePrefix);
+        dbSqlSessionFactory.setTablePrefixIsSchema(tablePrefixIsSchema);
+        dbSqlSessionFactory.setDatabaseCatalog(databaseCatalog);
+        dbSqlSessionFactory.setDatabaseSchema(databaseSchema);
+        dbSqlSessionFactory.setMaxNrOfStatementsInBulkInsert(maxNrOfStatementsInBulkInsert);
+        
+        initDbSqlSessionFactoryEntitySettings();
+        
+        addSessionFactory(dbSqlSessionFactory);
+    }
+    
+    public DbSqlSessionFactory createDbSqlSessionFactory() {
+        return new DbSqlSessionFactory();
+    }
+    
+    protected abstract void initDbSqlSessionFactoryEntitySettings();
+    
+    protected void defaultInitDbSqlSessionFactoryEntitySettings(List<Class<? extends Entity>> insertOrder, List<Class<? extends Entity>> deleteOrder) {
+        for (Class<? extends Entity> clazz : insertOrder) {
+            dbSqlSessionFactory.getInsertionOrder().add(clazz);
+
+            if (isBulkInsertEnabled) {
+                dbSqlSessionFactory.getBulkInserteableEntityClasses().add(clazz);
+            }
+        }
+
+        for (Class<? extends Entity> clazz : deleteOrder) {
+            dbSqlSessionFactory.getDeletionOrder().add(clazz);
+        }
+    }
 
     public void initTransactionFactory() {
         if (transactionFactory == null) {
@@ -470,6 +637,7 @@ public abstract class AbstractEngineConfiguration {
         configuration.setEnvironment(environment);
 
         initCustomMybatisMappers(configuration);
+        initMybatisTypeHandlers(configuration);
 
         configuration = parseMybatisConfiguration(parser);
         return configuration;
@@ -481,6 +649,10 @@ public abstract class AbstractEngineConfiguration {
                 configuration.addMapper(clazz);
             }
         }
+    }
+    
+    public void initMybatisTypeHandlers(Configuration configuration) {
+        // To be extended
     }
 
     public Configuration parseMybatisConfiguration(XMLConfigBuilder parser) {
@@ -525,7 +697,12 @@ public abstract class AbstractEngineConfiguration {
     }
 
     protected InputStream getResourceAsStream(String resource) {
-        return this.getClass().getClassLoader().getResourceAsStream(resource);
+        ClassLoader classLoader = getClassLoader();
+        if (classLoader != null) {
+            return getClassLoader().getResourceAsStream(resource);
+        } else {
+            return this.getClass().getClassLoader().getResourceAsStream(resource);
+        }
     }
 
     public abstract InputStream getMyBatisXmlConfigurationStream();
@@ -577,6 +754,15 @@ public abstract class AbstractEngineConfiguration {
 
     public AbstractEngineConfiguration setDbSchemaManager(DbSchemaManager dbSchemaManager) {
         this.dbSchemaManager = dbSchemaManager;
+        return this;
+    }
+
+    public DbSchemaManager getCommonDbSchemaManager() {
+        return commonDbSchemaManager;
+    }
+
+    public AbstractEngineConfiguration setCommonDbSchemaManager(DbSchemaManager commonDbSchemaManager) {
+        this.commonDbSchemaManager = commonDbSchemaManager;
         return this;
     }
 
@@ -820,9 +1006,21 @@ public abstract class AbstractEngineConfiguration {
         }
         engineConfigurations.put(key, engineConfiguration);
     }
+    
+    public Map<String, AbstractServiceConfiguration> getServiceConfigurations() {
+        return serviceConfigurations;
+    }
 
-    public Collection<? extends CommandInterceptor> getDefaultCommandInterceptors() {
-        return defaultCommandInterceptors;
+    public AbstractEngineConfiguration setServiceConfigurations(Map<String, AbstractServiceConfiguration> serviceConfigurations) {
+        this.serviceConfigurations = serviceConfigurations;
+        return this;
+    }
+    
+    public void addServiceConfiguration(String key, AbstractServiceConfiguration serviceConfiguration) {
+        if (serviceConfigurations == null) {
+            serviceConfigurations = new HashMap<>();
+        }
+        serviceConfigurations.put(key, serviceConfiguration);
     }
 
     public void setDefaultCommandInterceptors(Collection<? extends CommandInterceptor> defaultCommandInterceptors) {
@@ -835,6 +1033,15 @@ public abstract class AbstractEngineConfiguration {
 
     public AbstractEngineConfiguration setSqlSessionFactory(SqlSessionFactory sqlSessionFactory) {
         this.sqlSessionFactory = sqlSessionFactory;
+        return this;
+    }
+    
+    public boolean isDbHistoryUsed() {
+        return isDbHistoryUsed;
+    }
+
+    public AbstractEngineConfiguration setDbHistoryUsed(boolean isDbHistoryUsed) {
+        this.isDbHistoryUsed = isDbHistoryUsed;
         return this;
     }
     
@@ -862,6 +1069,24 @@ public abstract class AbstractEngineConfiguration {
 
     public AbstractEngineConfiguration setTransactionContextFactory(TransactionContextFactory transactionContextFactory) {
         this.transactionContextFactory = transactionContextFactory;
+        return this;
+    }
+    
+    public int getMaxNrOfStatementsInBulkInsert() {
+        return maxNrOfStatementsInBulkInsert;
+    }
+
+    public AbstractEngineConfiguration setMaxNrOfStatementsInBulkInsert(int maxNrOfStatementsInBulkInsert) {
+        this.maxNrOfStatementsInBulkInsert = maxNrOfStatementsInBulkInsert;
+        return this;
+    }
+    
+    public boolean isBulkInsertEnabled() {
+        return isBulkInsertEnabled;
+    }
+
+    public AbstractEngineConfiguration setBulkInsertEnabled(boolean isBulkInsertEnabled) {
+        this.isBulkInsertEnabled = isBulkInsertEnabled;
         return this;
     }
 
@@ -1044,4 +1269,26 @@ public abstract class AbstractEngineConfiguration {
         this.clock = clock;
         return this;
     }
+    
+    public int getMaxLengthString() {
+        if (maxLengthStringVariableType == -1) {
+            if ("oracle".equalsIgnoreCase(databaseType)) {
+                return DEFAULT_ORACLE_MAX_LENGTH_STRING;
+            } else {
+                return DEFAULT_GENERIC_MAX_LENGTH_STRING;
+            }
+        } else {
+            return maxLengthStringVariableType;
+        }
+    }
+    
+    public int getMaxLengthStringVariableType() {
+        return maxLengthStringVariableType;
+    }
+
+    public AbstractEngineConfiguration setMaxLengthStringVariableType(int maxLengthStringVariableType) {
+        this.maxLengthStringVariableType = maxLengthStringVariableType;
+        return this;
+    }
+    
 }

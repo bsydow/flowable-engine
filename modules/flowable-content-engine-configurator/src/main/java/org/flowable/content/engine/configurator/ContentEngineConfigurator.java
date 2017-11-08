@@ -54,9 +54,11 @@ public class ContentEngineConfigurator extends AbstractEngineConfigurator {
             contentEngineConfiguration = new StandaloneContentEngineConfiguration();
         }
         
-        initialiseCommonProperties(processEngineConfiguration, contentEngineConfiguration, EngineConfigurationConstants.KEY_CONTENT_ENGINE_CONFIG);
+        initialiseCommonProperties(processEngineConfiguration, contentEngineConfiguration);
 
         initContentEngine();
+        
+        initServiceConfigurations(processEngineConfiguration, contentEngineConfiguration);
     }
     
     @Override
